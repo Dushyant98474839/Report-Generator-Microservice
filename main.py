@@ -12,11 +12,12 @@ import uuid
 import schedule
 import time
 import threading
+import traceback
 from typing import Dict
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from database import Base, SessionLocal, get_db, engine
-from models import User
+from models import Job, User
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -92,8 +93,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
-# Load transformation rules
-def load_transformations():
+def load_transformations():   #job_id":"790f1487-a679-4337-a9b9-758b11333e31","status":"processing","report_filename":"report_37f4b9e4-428c-4ca7-a898-80e9bc035f8b.csv"
     try:
         with open(TRANSFORM_CONFIG, 'r') as f:
             return yaml.safe_load(f)
@@ -101,55 +101,80 @@ def load_transformations():
         logger.error(f"Error loading transformation config: {e}")
         raise HTTPException(status_code=500, detail="Failed to load transformation config")
 
-# Apply transformations
 def apply_transformations(input_df: pd.DataFrame, ref_df: pd.DataFrame, transformations: Dict) -> pd.DataFrame:
     output_df = pd.DataFrame()
 
-    # Create a context dictionary dynamically with all columns
-    input_context = {col: input_df[col] for col in input_df.columns}
-    ref_context = {col: ref_df[col] for col in ref_df.columns}
-
-    # Merge both into a single context for eval
-    context = {**input_context, **ref_context, 'max': max, 'min': min, 'len': len}
+    # Create context with direct column access
+    context = {
+        **{col: input_df[col] for col in input_df.columns},
+        **{col: ref_df[col] for col in ref_df.columns},
+        'max': max,
+        'min': min,
+        'len': len,
+        'float': float,
+        'pd': pd
+    }
 
     for out_field, rule in transformations.items():
         try:
             if isinstance(rule, str):
                 output_df[out_field] = eval(rule, {}, context)
             else:
-                # If rule is a function
                 output_df[out_field] = rule(input_df, ref_df)
         except Exception as e:
             logger.error(f"Error applying transformation for {out_field}: {e}")
-            raise HTTPException(status_code=500, detail=f"Transformation error for {out_field}")
+            logger.error(f"Exception details: {str(e)}")
+            logger.error(f"Transformation rule: {rule}")
+            raise HTTPException(status_code=500, detail=f"Transformation error for {out_field}: {str(e)}")
 
     return output_df
 
+# ... (previous code unchanged until process_report)
 
 def process_report(input_file: str, ref_file: str, output_file: str):
     try:
         start_time = time.time()
-        logger.info("Starting report generation")
+        logger.info(f"Starting report generation for {input_file}")
         
-        input_df = pd.read_csv(input_file, chunksize=10000)
+        # Validate files exist
+        if not os.path.exists(input_file):
+            raise HTTPException(status_code=404, detail=f"Input file not found: {input_file}")
+        if not os.path.exists(ref_file):
+            raise HTTPException(status_code=404, detail=f"Reference file not found: {ref_file}")
+        
         ref_df = pd.read_csv(ref_file)
         
-        merged_df = pd.DataFrame()
-        for chunk in input_df:
-            chunk_merged = chunk.merge(ref_df, on=['refkey1', 'refkey2'], how='left')
-            merged_df = pd.concat([merged_df, chunk_merged])
+        # Validate required columns
+        required_input_cols = ['field1', 'field2', 'field3', 'field4', 'field5', 'refkey1', 'refkey2']
+        required_ref_cols = ['refkey1', 'refdata1', 'refkey2', 'refdata2', 'refdata3', 'refdata4']
+        missing_input_cols = [col for col in required_input_cols if col not in pd.read_csv(input_file, nrows=1).columns]
+        missing_ref_cols = [col for col in required_ref_cols if col not in ref_df.columns]
+        if missing_input_cols:
+            raise HTTPException(status_code=400, detail=f"Missing input columns: {missing_input_cols}")
+        if missing_ref_cols:
+            raise HTTPException(status_code=400, detail=f"Missing reference columns: {missing_ref_cols}")
         
-        transformations = load_transformations()
+        first_chunk = True
+        chunk_count = 0
+        for chunk in pd.read_csv(input_file, chunksize=1000):  # Reduced chunksize
+            chunk_count += 1
+            logger.info(f"Processing chunk {chunk_count} with {len(chunk)} rows")
+            output_chunk = apply_transformations(chunk, ref_df, load_transformations())
+            if output_chunk is None:
+                raise HTTPException(status_code=500, detail="Transformation returned None")
+            
+            output_chunk.to_csv(output_file, index=False, mode='w' if first_chunk else 'a', 
+                               header=first_chunk)
+            first_chunk = False
         
-        output_df = apply_transformations(merged_df, ref_df, transformations)
-        
-        output_df.to_csv(output_file, index=False)
-        
-        logger.info(f"Report generated in {time.time() - start_time:.2f} seconds")
+        logger.info(f"Report generated in {time.time() - start_time:.2f} seconds, processed {chunk_count} chunks")
         return output_file
     except Exception as e:
         logger.error(f"Error processing report: {e}")
-        raise HTTPException(status_code=500, detail="Report generation failed")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
+
+# ... (rest of the file unchanged)
 
 @app.post("/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -199,7 +224,7 @@ async def upload_reference(file: UploadFile = File(...)):
     return {"filename": os.path.basename(file_path)}
 
 @app.post("/generate-report", dependencies=[Depends(get_current_user)])
-async def generate_report(input_filename: str, ref_filename: str):
+async def generate_report(input_filename: str, ref_filename: str, db: Session = Depends(get_db)):
     input_path = os.path.join(INPUT_DIR, input_filename)
     ref_path = os.path.join(INPUT_DIR, ref_filename)
     output_filename = f"report_{uuid.uuid4()}.csv"
@@ -208,8 +233,53 @@ async def generate_report(input_filename: str, ref_filename: str):
     if not os.path.exists(input_path) or not os.path.exists(ref_path):
         raise HTTPException(status_code=404, detail="Input or reference file not found")
     
-    output_file = process_report(input_path, ref_path, output_path)
-    return {"report_filename": os.path.basename(output_file)}
+    job_id = str(uuid.uuid4())
+    new_job = Job(id=job_id, status="processing", filename=output_filename)
+    db.add(new_job)
+    db.commit()
+    
+    threading.Thread(
+        target=process_report_with_error_handling,
+        args=(input_path, ref_path, output_path, job_id),
+        daemon=True
+    ).start()
+    
+    return {"job_id": job_id, "status": "processing", "report_filename": output_filename}
+
+def process_report_with_error_handling(input_path, ref_path, output_path, job_id):
+    try:
+        process_report(input_path, ref_path, output_path)
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.status = "completed"
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        error_message = f"{str(e)}\n{traceback.format_exc()}"
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error = error_message
+                db.commit()
+        finally:
+            db.close()
+        logger.error(f"Background processing error for job {job_id}: {error_message}")
+
+@app.get("/job-status/{job_id}", dependencies=[Depends(get_current_user)])
+async def get_job_status(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "status": job.status,
+        "report_filename": job.filename,
+        "error": job.error if job.status == "failed" else None
+    }
 
 @app.get("/download/{filename}", dependencies=[Depends(get_current_user)])
 async def download_report(filename: str):
