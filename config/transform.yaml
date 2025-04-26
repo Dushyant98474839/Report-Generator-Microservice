@@ -1,0 +1,5 @@
+outfield1: "field1 + field2"
+outfield2: "refdata1"
+outfield3: "refdata2 + refdata3"
+outfield4: "pd.to_numeric(field3) * pd.Series([max(x, y) for x, y in zip(field5, refdata4)])"
+outfield5: "pd.Series([max(x, y) for x, y in zip(field5, refdata4)])"

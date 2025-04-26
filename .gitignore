@@ -1,0 +1,23 @@
+# Ignore virtual environment
+myenv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore all CSV files
+*.csv
+
+# Ignore environment variables file (optional but recommended)
+.env
+
+# Ignore VSCode settings (optional, if you use VSCode)
+.vscode/
+
+# Ignore Docker stuff (optional if generated)
+*.log
+
+# Ignore outputs
+outputs/

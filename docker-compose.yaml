@@ -1,21 +1,45 @@
 version: '3.8'
+
 services:
   app:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - ./inputs:/app/inputs
-      - ./outputs:/app/outputs
-      - ./config:/app/config
+      - ./:/app
     environment:
-      - PYTHONUNBUFFERED=1
-      # - SECRET_KEY=your-secure-secret-key
+      - SECRET_KEY=your-secret-key
       - DATABASE_URL=postgresql://user:password@postgres:5432/report_db
     depends_on:
       - postgres
-    env_file:
-      - .env
+      - redis
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+
+  celery:
+    build: .
+    command: celery -A main.celery_app worker --loglevel=info --concurrency=4
+    volumes:
+      - ./:/app
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/report_db
+    depends_on:
+      - redis
+      - postgres
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+
+  redis:
+    image: redis:6.2
+    ports:
+      - "6379:6379"
+
   postgres:
     image: postgres:13
     environment:
@@ -26,5 +50,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+
 volumes:
   postgres_data:
