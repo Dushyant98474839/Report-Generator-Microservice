@@ -18,11 +18,28 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from database import Base, SessionLocal, get_db, engine
 from models import Job, User
+from celery import Celery
+import pickle
+import threading as thread_module
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Report Generator Microservice")
+
+# Celery configuration
+celery_app = Celery(
+    'report_generator',
+    broker='redis://redis:6379/0',
+    backend='redis://redis:6379/0'
+)
+celery_app.conf.update(
+    task_serializer='pickle',
+    accept_content=['pickle'],
+    result_serializer='pickle',
+    task_track_started=True,
+    task_time_limit=3600  # 1 hour timeout per task
+)
 
 SECRET_KEY = os.getenv("SECRET_KEY") 
 ALGORITHM = "HS256"
@@ -93,7 +110,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
-def load_transformations():   #job_id":"790f1487-a679-4337-a9b9-758b11333e31","status":"processing","report_filename":"report_37f4b9e4-428c-4ca7-a898-80e9bc035f8b.csv"
+def load_transformations():
     try:
         with open(TRANSFORM_CONFIG, 'r') as f:
             return yaml.safe_load(f)
@@ -104,7 +121,6 @@ def load_transformations():   #job_id":"790f1487-a679-4337-a9b9-758b11333e31","s
 def apply_transformations(input_df: pd.DataFrame, ref_df: pd.DataFrame, transformations: Dict) -> pd.DataFrame:
     output_df = pd.DataFrame()
 
-    # Create context with direct column access
     context = {
         **{col: input_df[col] for col in input_df.columns},
         **{col: ref_df[col] for col in ref_df.columns},
@@ -129,53 +145,110 @@ def apply_transformations(input_df: pd.DataFrame, ref_df: pd.DataFrame, transfor
 
     return output_df
 
-# ... (previous code unchanged until process_report)
+@celery_app.task
+def process_chunk(chunk_data, ref_data, transformations, chunk_index, output_file):
+    try:
+        logger.info(f"Processing chunk {chunk_index} with {len(chunk_data)} rows")
+        chunk_df = pd.DataFrame(chunk_data)
+        ref_df = pd.DataFrame(ref_data)
+        
+        # Validate columns
+        required_cols = set()
+        for rule in transformations.values():
+            if isinstance(rule, str):
+                # Extract column names from rule (simple heuristic)
+                for col in chunk_df.columns:
+                    if col in rule:
+                        required_cols.add(col)
+                for col in ref_df.columns:
+                    if col in rule:
+                        required_cols.add(col)
+        
+        missing_cols = [col for col in required_cols if col not in chunk_df.columns and col not in ref_df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns in chunk {chunk_index}: {missing_cols}")
+        
+        output_chunk = apply_transformations(chunk_df, ref_df, transformations)
+        if output_chunk is None or output_chunk.empty:
+            raise ValueError(f"Transformation returned None or empty for chunk {chunk_index}")
+        
+        temp_file = f"{output_file}.chunk_{chunk_index}"
+        output_chunk.to_csv(temp_file, index=False)
+        logger.info(f"Completed chunk {chunk_index}")
+        return temp_file
+    except Exception as e:
+        logger.error(f"Error in chunk {chunk_index}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise  # Let Celery handle retries or mark task as failed
 
 def process_report(input_file: str, ref_file: str, output_file: str):
     try:
         start_time = time.time()
         logger.info(f"Starting report generation for {input_file}")
         
-        # Validate files exist
         if not os.path.exists(input_file):
             raise HTTPException(status_code=404, detail=f"Input file not found: {input_file}")
         if not os.path.exists(ref_file):
             raise HTTPException(status_code=404, detail=f"Reference file not found: {ref_file}")
         
+        # Load reference data
+        ref_start = time.time()
         ref_df = pd.read_csv(ref_file)
+        logger.info(f"Reference data loaded in {time.time() - ref_start:.2f} seconds")
         
-        # Validate required columns
+        # Validate columns
         required_input_cols = ['field1', 'field2', 'field3', 'field4', 'field5', 'refkey1', 'refkey2']
         required_ref_cols = ['refkey1', 'refdata1', 'refkey2', 'refdata2', 'refdata3', 'refdata4']
-        missing_input_cols = [col for col in required_input_cols if col not in pd.read_csv(input_file, nrows=1).columns]
+        input_cols = pd.read_csv(input_file, nrows=1).columns
+        missing_input_cols = [col for col in required_input_cols if col not in input_cols]
         missing_ref_cols = [col for col in required_ref_cols if col not in ref_df.columns]
         if missing_input_cols:
             raise HTTPException(status_code=400, detail=f"Missing input columns: {missing_input_cols}")
         if missing_ref_cols:
             raise HTTPException(status_code=400, detail=f"Missing reference columns: {missing_ref_cols}")
         
-        first_chunk = True
+        transformations = load_transformations()
         chunk_count = 0
-        for chunk in pd.read_csv(input_file, chunksize=1000):  # Reduced chunksize
-            chunk_count += 1
-            logger.info(f"Processing chunk {chunk_count} with {len(chunk)} rows")
-            output_chunk = apply_transformations(chunk, ref_df, load_transformations())
-            if output_chunk is None:
-                raise HTTPException(status_code=500, detail="Transformation returned None")
-            
-            output_chunk.to_csv(output_file, index=False, mode='w' if first_chunk else 'a', 
-                               header=first_chunk)
-            first_chunk = False
+        tasks = []
         
-        logger.info(f"Report generated in {time.time() - start_time:.2f} seconds, processed {chunk_count} chunks")
+        # Process chunks
+        chunk_start = time.time()
+        for chunk in pd.read_csv(input_file, chunksize=1000, dtype=str):
+            chunk_count += 1
+            chunk_data = chunk.to_dict('records')
+            ref_data = ref_df.to_dict('records')
+            task = process_chunk.delay(chunk_data, ref_data, transformations, chunk_count, output_file)
+            tasks.append(task)
+        logger.info(f"Queued {chunk_count} chunks in {time.time() - chunk_start:.2f} seconds")
+        
+        # Collect results asynchronously
+        temp_files = []
+        for task in tasks:
+            try:
+                result = task.get(timeout=600)  # 10-minute timeout per task
+                temp_files.append(result)
+            except Exception as e:
+                logger.error(f"Task failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Chunk processing failed: {str(e)}")
+        
+        # Combine results
+        combine_start = time.time()
+        first_chunk = True
+        for temp_file in temp_files:
+            temp_df = pd.read_csv(temp_file)
+            temp_df.to_csv(output_file, index=False, mode='w' if first_chunk else 'a', header=first_chunk)
+            first_chunk = False
+            os.remove(temp_file)
+        logger.info(f"Combined {chunk_count} chunks in {time.time() - combine_start:.2f} seconds")
+        
+        total_time = time.time() - start_time
+        logger.info(f"Report generated in {total_time:.2f} seconds, processed {chunk_count} chunks")
         return output_file
     except Exception as e:
-        logger.error(f"Error processing report: {e}")
+        logger.error(f"Error processing report: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
-
-# ... (rest of the file unchanged)
-
+    
 @app.post("/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = authenticate_user(db, form_data.username, form_data.password)
@@ -190,6 +263,8 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
         data={"sub": user.username}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+#job_id":"65cce48c-45d6-4a14-9aa4-6261bb829d63","status":"processing","report_filename":"report_19a22474-d110-44f0-920a-e40526232956.csv
 
 @app.post("/users", response_model=Token)
 async def create_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -223,6 +298,32 @@ async def upload_reference(file: UploadFile = File(...)):
     logger.info(f"Reference file uploaded: {file_path}")
     return {"filename": os.path.basename(file_path)}
 
+@celery_app.task
+def process_report_task(input_path, ref_path, output_path, job_id):
+    try:
+        process_report(input_path, ref_path, output_path)
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.status = "completed"
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        error_message = f"{str(e)}\n{traceback.format_exc()}"
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error = error_message
+                db.commit()
+        finally:
+            db.close()
+        logger.error(f"Background processing error for job {job_id}: {error_message}")
+        raise
+
 @app.post("/generate-report", dependencies=[Depends(get_current_user)])
 async def generate_report(input_filename: str, ref_filename: str, db: Session = Depends(get_db)):
     input_path = os.path.join(INPUT_DIR, input_filename)
@@ -234,17 +335,13 @@ async def generate_report(input_filename: str, ref_filename: str, db: Session = 
         raise HTTPException(status_code=404, detail="Input or reference file not found")
     
     job_id = str(uuid.uuid4())
-    new_job = Job(id=job_id, status="processing", filename=output_filename)
+    new_job = Job(id=job_id, status="queued", filename=output_filename)
     db.add(new_job)
     db.commit()
     
-    threading.Thread(
-        target=process_report_with_error_handling,
-        args=(input_path, ref_path, output_path, job_id),
-        daemon=True
-    ).start()
+    process_report_task.delay(input_path, ref_path, output_path, job_id)
     
-    return {"job_id": job_id, "status": "processing", "report_filename": output_filename}
+    return {"job_id": job_id, "status": "queued", "report_filename": output_filename}
 
 def process_report_with_error_handling(input_path, ref_path, output_path, job_id):
     try:
