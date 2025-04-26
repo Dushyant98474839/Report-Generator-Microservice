@@ -329,11 +329,3 @@ This runs a report daily at 14:30 using `inputs/input.csv` and `inputs/reference
 5. Open a Pull Request.
 
 Please include tests and update documentation for new features.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Contact
-
-For issues or questions, open an issue on the [GitHub repository](https://github.com/Dushyant98474839/Report-Generator-Microservice) or contact the maintainer at [your-email@example.com].
