@@ -10,3 +10,21 @@ services:
       - ./config:/app/config
     environment:
       - PYTHONUNBUFFERED=1
+      # - SECRET_KEY=your-secure-secret-key
+      - DATABASE_URL=postgresql://user:password@postgres:5432/report_db
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=report_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+volumes:
+  postgres_data:
