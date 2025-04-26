@@ -1,0 +1,5 @@
+outfield1: "field1 + field2"
+outfield2: "refdata1"
+outfield3: "refdata2 + refdata3"
+outfield4: "float(field3) * max(field5, refdata4)"
+outfield5: "max(field5, refdata4)"
