@@ -55,14 +55,6 @@ Create a secure `SECRET_KEY` for JWT authentication:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Edit `docker-compose.yml` to include the generated key:
-
-```yaml
-services:
-  app:
-    environment:
-      - SECRET_KEY=<your-secret-key>
-```
 
 ### 3. Start Docker Services
 
